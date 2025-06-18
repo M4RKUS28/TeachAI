@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Paper,
@@ -12,6 +12,7 @@ import {
   Radio,
   Loader,
   Box,
+  Stack,
 } from '@mantine/core';
 import { toast } from 'react-toastify';
 import { courseService } from '../api/courseService';
@@ -26,75 +27,219 @@ const Quiz = ({ courseId, chapterId, onQuestionCountChange }) => {
   const [otAnswers, setOtAnswers] = useState({});
   const [gradingQuestion, setGradingQuestion] = useState(null);
   const [questionFeedback, setQuestionFeedback] = useState({});
+  const [isPolling, setIsPolling] = useState(false);
+  const [courseStatus, setCourseStatus] = useState(null);
+
+  // Track if component is mounted to prevent state updates after unmount
+  const isMounted = useRef(true);
+
+  // Cleanup function to cancel any pending operations when component unmounts
+  useEffect(() => {
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  /**
+   * Processes the quiz questions data and updates the component state
+   * @param {Array} questionsData - Array of question objects
+   */
+  const processQuizQuestions = useCallback((questionsData) => {
+    if (!questionsData || !Array.isArray(questionsData)) return;
+
+    if (questionsData.length > 0) {
+      setQuestions(questionsData);
+
+      // Notify parent of question count
+      if (onQuestionCountChange) {
+        onQuestionCountChange(questionsData.length);
+      }
+
+      // Initialize answers with existing user answers if available
+      const initialMCAnswers = {};
+      const initialOTAnswers = {};
+      const initialFeedback = {};
+
+      questionsData.forEach((question) => {
+        if (question.type === 'MC') {
+          initialMCAnswers[question.id] = question.users_answer || '';
+          // If user has already answered and there's an explanation, show feedback immediately
+          if (question.users_answer) {
+            const isCorrect = question.users_answer === question.correct_answer;
+            initialFeedback[question.id] = {
+              feedback: question.explanation || (isCorrect ? 'Correct!' : 'Incorrect. Please review the material.'),
+              points_received: isCorrect ? 1 : 0,
+              correct_answer: question.correct_answer,
+              is_correct: isCorrect
+            };
+          }
+        } else if (question.type === 'OT') {
+          initialOTAnswers[question.id] = question.users_answer || '';
+          // If there's existing feedback for open text questions, add it to feedback state
+          if (question.feedback) {
+            initialFeedback[question.id] = {
+              feedback: question.feedback,
+              points_received: question.points_received,
+              correct_answer: question.correct_answer
+            };
+          }
+        }
+      });
+
+      setMcAnswers(initialMCAnswers);
+      setOtAnswers(initialOTAnswers);
+      setQuestionFeedback(initialFeedback);
+      return true; // Indicate that questions were processed
+    } else {
+      // No questions found
+      if (onQuestionCountChange) {
+        onQuestionCountChange(0);
+      }
+      return false; // Indicate no questions were found
+    }
+  }, [onQuestionCountChange]);
+
+  /**
+   * Fetches the current course status from the server
+   */
+  const fetchCourseStatus = useCallback(async () => {
+    console.log('Fetching course status for courseId:', courseId);
+    try {
+      const courseData = await courseService.getCourseById(courseId);
+      console.log('Fetched course data:', courseData);
+      if (isMounted.current) {
+        console.log('Setting course status:', courseData.status);
+        setCourseStatus(courseData.status);
+        return courseData.status;
+      } else {
+        console.warn('Component is unmounted, skipping state update for course status');
+      }
+    } catch (error) {
+      console.error('Error fetching course status:', error);
+    }
+    return null;
+  }, [courseId]);
+
+  /**
+   * Polls for new quiz questions while the course is being created
+   */
+  const pollForQuizQuestions = useCallback(async () => {
+    if (!isMounted.current) return;
+
+    setIsPolling(true);
+    let pollInterval;
+
+    try {
+      // Initial check for course status
+      const status = await fetchCourseStatus();
+
+      // Only poll if course is in creating status
+      if (status === 'CourseStatus.CREATING') {
+        pollInterval = setInterval(async () => {
+          try {
+            // 1. Check course status first
+            const currentStatus = await fetchCourseStatus();
+
+            // If course is no longer in creating status, stop polling
+            if (currentStatus !== 'CourseStatus.CREATING') {
+              clearInterval(pollInterval);
+              if (isMounted.current) {
+                setIsPolling(false);
+                setCourseStatus(currentStatus);
+              }
+              return;
+            }
+
+            // 2. Try to fetch questions
+            const questionsData = await courseService.getChapterQuestions(courseId, chapterId);
+
+            // 3. If we got questions, process them and stop polling
+            if (questionsData && questionsData.length > 0) {
+              const hasProcessedQuestions = processQuizQuestions(questionsData);
+              if (hasProcessedQuestions) {
+                clearInterval(pollInterval);
+                if (isMounted.current) {
+                  setIsPolling(false);
+                  toast.success(t('quiz.questionsAvailable'));
+                }
+              }
+            }
+          } catch (error) {
+            console.error('Error during polling:', error);
+            // Don't stop polling on error, just log it and continue
+          }
+        }, 1000); // Poll every second
+      } else {
+        // Course is not in creating status, no need to poll
+        setIsPolling(false);
+      }
+    } catch (error) {
+      console.error('Error starting polling:', error);
+      if (isMounted.current) {
+        setIsPolling(false);
+      }
+    }
+
+    // Cleanup function to clear interval if component unmounts
+    return () => {
+      if (pollInterval) clearInterval(pollInterval);
+    };
+  }, [courseId, chapterId, fetchCourseStatus, processQuizQuestions, t]);
 
   // Fetch quiz questions when component mounts
   useEffect(() => {
     const fetchQuiz = async () => {
       try {
         setLoading(true);
-        // Use the existing getChapterQuestions method that returns full QuestionResponse data
+        console.log('Fetching quiz questions for course:', courseId, 'chapter:', chapterId);
+
+        // First, get the current course status
+        const status = await fetchCourseStatus();
+        console.log('Current course status:', status);
+
+        // Try to fetch questions
         const questionsData = await courseService.getChapterQuestions(courseId, chapterId);
+        console.log('Fetched questions:', questionsData);
 
-        if (questionsData && questionsData.length > 0) {
-          setQuestions(questionsData);
+        // Process questions if we got any
+        const hasQuestions = processQuizQuestions(questionsData);
+        console.log('Has questions:', hasQuestions);
 
-          // Notify parent of question count
-          if (onQuestionCountChange) {
-            onQuestionCountChange(questionsData.length);
-          }
-
-          // Initialize answers with existing user answers if available
-          const initialMCAnswers = {};
-          const initialOTAnswers = {};
-          const initialFeedback = {};
-
-          questionsData.forEach((question) => {
-            if (question.type === 'MC') {
-              initialMCAnswers[question.id] = question.users_answer || '';
-              // If user has already answered and there's an explanation, show feedback immediately
-              if (question.users_answer) {
-                const isCorrect = question.users_answer === question.correct_answer;
-                initialFeedback[question.id] = {
-                  feedback: question.explanation || (isCorrect ? 'Correct!' : 'Incorrect. Please review the material.'),
-                  points_received: isCorrect ? 1 : 0,
-                  correct_answer: question.correct_answer,
-                  is_correct: isCorrect
-                };
-              }
-            } else if (question.type === 'OT') {
-              initialOTAnswers[question.id] = question.users_answer || '';
-              // If there's existing feedback for open text questions, add it to feedback state
-              if (question.feedback) {
-                initialFeedback[question.id] = {
-                  feedback: question.feedback,
-                  points_received: question.points_received,
-                  correct_answer: question.correct_answer
-                };
-              }
-            }
-          });
-
-          setMcAnswers(initialMCAnswers);
-          setOtAnswers(initialOTAnswers);
-          setQuestionFeedback(initialFeedback);
+        // If no questions but course is still being created, start polling
+        if (!hasQuestions && status === 'CourseStatus.CREATING') {
+          console.log('No questions found, starting polling for quiz questions...');
+          await pollForQuizQuestions();
+        } else if (hasQuestions) {
+          console.log('Questions processed successfully, no need to poll.');
+          setIsPolling(false);
         } else {
-          // No questions found
-          if (onQuestionCountChange) {
-            onQuestionCountChange(0);
-          }
+          console.log('No questions found and course is not being created, stopping polling.');
+          setIsPolling(false);
         }
+
 
         setError(null);
       } catch (error) {
-        setError('Failed to load quiz questions');
-        console.error('Error fetching quiz questions:', error);
+        console.error('Error in fetchQuiz:', error);
+        setError(t('quiz.errors.loadFailed'));
       } finally {
-        setLoading(false);
+        console.log('Fetch quiz completed');
+        // Only set loading to false if component is still mounted
+        console.log('isMounted:', isMounted.current);
+        if (isMounted.current) {
+          setLoading(false);
+        }
       }
     };
 
     fetchQuiz();
-  }, [courseId, chapterId]);
+
+
+    // Cleanup function to cancel any pending operations
+    return () => {
+      isMounted.current = false;
+    };
+  }, [courseId, chapterId, fetchCourseStatus, processQuizQuestions, pollForQuizQuestions, t]);
 
   const handleMCAnswerChange = async (questionId, value) => {
     // Optimistically update UI
@@ -234,14 +379,28 @@ const Quiz = ({ courseId, chapterId, onQuestionCountChange }) => {
     return 'Correct'; // This covers 1/1 for MC and 2/2 for OT
   };
 
+  // Show loading state
   if (loading) {
     return (
-      <Paper shadow="xs" p="md" withBorder>
-        <Group position="center">
-          <Loader size="lg" />
-          <Text>Loading quiz...</Text>
-        </Group>
-      </Paper>
+      <Box p="md">
+        <Loader />
+        <Text>{t('loading')}</Text>
+      </Box>
+    );
+  }
+
+  // Show polling state when waiting for quizzes to be generated
+  if (isPolling) {
+    return (
+      <Stack align="center" justify="center" p="xl">
+        <Loader size="xl" variant="dots" />
+        <Text align="center" color="dimmed" mt="md">
+          {t('quiz.generatingQuestions')}
+        </Text>
+        <Text size="sm" color="dimmed" align="center">
+          {t('quiz.thisMayTakeAMoment')}
+        </Text>
+      </Stack>
     );
   }
 
